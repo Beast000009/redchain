@@ -1,0 +1,17 @@
+langgraph
+langchain-core
+google-genai
+python-nmap
+dnspython
+python-whois
+shodan
+typer
+rich
+pydantic
+pydantic-settings
+jinja2
+weasyprint
+httpx
+pytest
+beautifulsoup4
+ipinfo
