@@ -30,9 +30,10 @@ def run_nmap_scan(target_ips: List[str]) -> List[Dict[str, Any]]:
         nm = nmap.PortScanner()
         target_str = " ".join(target_ips)
         
-        # -sV: service version, -O: OS detection
-        # Need root for OS detection ideally, fallback gracefully if not
-        flags = "-sV -O"
+        # -sV: service version
+        # Removed -O because it requires root privileges and breaks the scan
+        # Added -Pn to skip host discovery since we already validated they are alive
+        flags = "-sV -Pn"
         if run_config.stealth:
             flags += " -T2"
         else:

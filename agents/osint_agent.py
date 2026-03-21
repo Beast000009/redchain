@@ -15,8 +15,21 @@ import ipinfo
 from bs4 import BeautifulSoup
 from rich.console import Console
 from rich.table import Table
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional
+import platform
+import shutil
+
+PLATFORM = platform.system()
+IS_MAC = PLATFORM == "Darwin"
+IS_LINUX = PLATFORM == "Linux"
+IS_WINDOWS = PLATFORM == "Windows"
+
+def find_tool(name: str) -> str | None:
+    return shutil.which(name)
+
+def require_sudo() -> bool:
+    return os.geteuid() == 0 if not IS_WINDOWS else False
 
 # Setup import from project root
 import sys
@@ -81,15 +94,24 @@ class OsintResult(BaseModel):
     sources_used: list[str] = []
     errors: dict[str, str] = {}
 
+async def _safe_run(coro, source_name: str, timeout: int = 30):
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        console.print(f"[yellow]![/yellow] [gray]{source_name}: timed out[/gray]")
+    except Exception as e:
+        console.print(f"[yellow]✗[/yellow] [gray]{source_name}: {e}[/gray]")
+
 
 # ── Internal Source Functions ────────────────────────────────────────────────
 
 def _run_harvester(domain: str, result: OsintResult):
     out_file = f"/tmp/harvest_{domain}"
+    harvester_bin = find_tool("theHarvester") or find_tool("theHarvester.py") or "theHarvester"
     try:
         proc = subprocess.run(
-            ["theHarvester", "-d", domain, "-b", "all", "-l", "500", "-f", out_file],
-            capture_output=True, text=True, timeout=120
+            [harvester_bin, "-d", domain, "-b", "google,bing,certspotter,crtsh,hackertarget,rapiddns,urlscan", "-l", "200", "-f", out_file],
+            capture_output=True, text=True, timeout=60
         )
         # Parse JSON
         json_path = f"{out_file}.json"
@@ -142,118 +164,64 @@ def _run_subfinder(domain: str, result: OsintResult):
         console.print(f"[yellow]✗[/yellow] [gray]subfinder[/gray]: {e}")
 
 async def _run_crtsh(client: httpx.AsyncClient, domain: str, result: OsintResult):
-    try:
-        res = await client.get(f"https://crt.sh/?q=%.{domain}&output=json")
-        if res.status_code == 200:
-            count = 0
-            for entry in res.json():
-                for name in entry.get("name_value", "").splitlines():
-                    name = name.strip().lower()
-                    if name.endswith(domain):
-                        if name.startswith("*."): name = name[2:]
-                        result.subdomains.append(name)
-                        count += 1
-            result.sources_used.append("crt.sh")
-            console.print(f"[green]✓[/green] [gray]crt.sh[/gray]: {count} subdomains")
-    except Exception as e:
-        result.errors["crt.sh"] = str(e)
-
-async def _run_hackertarget(client: httpx.AsyncClient, domain: str, result: OsintResult):
-    try:
-        res = await client.get(f"https://api.hackertarget.com/hostsearch/?q={domain}")
-        count = 0
-        if res.status_code == 200:
-            for line in res.text.splitlines():
-                if "," in line:
-                    sub = line.split(",")[0].strip().lower()
-                    if sub.endswith(domain):
-                        result.subdomains.append(sub)
-                        count += 1
-        result.sources_used.append("HackerTarget")
-        console.print(f"[green]✓[/green] [gray]HackerTarget[/gray]: {count} subdomains")
-    except Exception as e:
-        result.errors["HackerTarget"] = str(e)
-
-async def _run_rapiddns(client: httpx.AsyncClient, domain: str, result: OsintResult):
-    try:
-        res = await client.get(f"https://rapiddns.io/subdomain/{domain}?full=1")
-        count = 0
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, "html.parser")
-            for row in soup.find_all("tr"):
-                cols = row.find_all("td")
-                if len(cols) > 0:
-                    sub = cols[0].text.strip().lower()
-                    if sub.endswith(domain):
-                        result.subdomains.append(sub)
-                        count += 1
-        result.sources_used.append("RapidDNS")
-        console.print(f"[green]✓[/green] [gray]RapidDNS[/gray]: {count} subdomains")
-    except Exception as e:
-        result.errors["RapidDNS"] = str(e)
-
-async def _run_threatminer(client: httpx.AsyncClient, domain: str, result: OsintResult):
-    try:
-        res = await client.get(f"https://api.threatminer.org/v2/domain.php?q={domain}&rt=5")
-        count = 0
-        if res.status_code == 200:
-            data = res.json()
-            if str(data.get("status_code")) == "200":
-                for sub in data.get("results", []):
-                    result.subdomains.append(sub.lower())
-                    count += 1
-        result.sources_used.append("ThreatMiner")
-        console.print(f"[green]✓[/green] [gray]ThreatMiner[/gray]: {count} subdomains")
-    except Exception as e:
-        result.errors["ThreatMiner"] = str(e)
-
-async def _run_otx(client: httpx.AsyncClient, domain: str, result: OsintResult):
-    try:
-        base = f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}"
-        
-        # Passive DNS
-        res_pdns = await client.get(f"{base}/passive_dns")
-        if res_pdns.status_code == 200:
-            pdns_data = res_pdns.json().get("passive_dns", [])
-            for r in pdns_data:
-                result.passive_dns_history.append({
-                    "address": r.get("address"),
-                    "record_type": r.get("record_type"),
-                    "hostname": r.get("hostname")
-                })
-        
-        # Malware
-        res_mal = await client.get(f"{base}/malware")
-        if res_mal.status_code == 200:
-            result.otx_malware_hits = len(res_mal.json().get("data", []))
+    headers = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
+    urls = [
+        f"https://crt.sh/?q=%.{domain}&output=json",
+        f"https://crt.sh/?q={domain}&output=json"
+    ]
+    subdomains_found = set()
+    
+    for url in urls:
+        for attempt in range(3):
+            try:
+                res = await client.get(url, headers=headers, timeout=45)
+                if res.status_code == 200:
+                    data = res.json()
+                    for entry in data:
+                        for name in entry.get("name_value", "").splitlines():
+                            name = name.strip().lower()
+                            if name.endswith(domain):
+                                if name.startswith("*."): name = name[2:]
+                                subdomains_found.add(name)
+                    break # Success, break retry loop
+            except Exception as e:
+                if attempt == 2:
+                    result.errors["crt.sh"] = str(e)
+            await asyncio.sleep(2)
             
-        result.sources_used.append("AlienVault OTX")
-        console.print(f"[green]✓[/green] [gray]AlienVault OTX[/gray]: {len(result.passive_dns_history)} passive DNS, {result.otx_malware_hits} malware")
-    except Exception as e:
-        result.errors["AlienVault OTX"] = str(e)
+    result.subdomains.extend(list(subdomains_found))
+    if subdomains_found:
+        result.sources_used.append("crt.sh")
+    console.print(f"[green]✓[/green] [gray]crt.sh[/gray]: {len(subdomains_found)} subdomains")
 
-async def _run_urlscan(client: httpx.AsyncClient, domain: str, result: OsintResult):
+def _run_amass(domain: str, result: OsintResult):
     try:
-        res = await client.get(f"https://urlscan.io/api/v1/search/?q=domain:{domain}")
-        if res.status_code == 200:
-            techs = set()
-            for scan in res.json().get("results", []):
-                result.urlscan_results.append(scan)
-                # Just extract rough tech from simple responses
-                page = scan.get("page", {})
-                if 'server' in page: techs.add(page['server'])
-            
-            result.technologies.extend(list(techs))
-            result.sources_used.append("URLScan.io")
-            console.print(f"[green]✓[/green] [gray]URLScan.io[/gray]: {len(techs)} technologies")
+        console.print("[cyan]Running Amass (passive enumeration)...[/cyan]")
+        proc = subprocess.run(
+            ["amass", "enum", "-passive", "-d", domain],
+            capture_output=True, text=True, timeout=300
+        )
+        count = 0
+        for line in proc.stdout.splitlines():
+            sub = line.strip().lower()
+            if sub and sub.endswith(domain):
+                result.subdomains.append(sub)
+                count += 1
+        result.sources_used.append("Amass (crt.sh, HackerTarget, ThreatMiner, RapidDNS, OTX, URLScan, etc)")
+        console.print(f"[green]✓[/green] [gray]Amass[/gray]: {count} subdomains")
+    except FileNotFoundError:
+        console.print(f"[yellow]![/yellow] [gray]Amass[/gray]: Not installed in PATH")
+        result.errors["Amass"] = "Not in PATH"
     except Exception as e:
-        result.errors["URLScan.io"] = str(e)
+        result.errors["Amass"] = str(e)
+        console.print(f"[yellow]✗[/yellow] [gray]Amass[/gray]: {e}")
 
 async def _run_dns(domain: str, result: OsintResult):
     try:
         results = {"A": [], "AAAA": [], "MX": [], "NS": [], "TXT": [], "CNAME": [], "SOA": []}
         resolver = dns.asyncresolver.Resolver()
         resolver.nameservers = ['8.8.8.8', '1.1.1.1']
+        resolver.lifetime = 5.0
         
         for rtype in results.keys():
             try:
@@ -468,22 +436,14 @@ async def run_osint(target: str) -> dict:
     result = OsintResult(domain=domain)
 
     # Note: ASN lookup requires an IP. We must run DNS lookup first 
-    # properly await it before triggering ASN, or we split the gather.
-    # To maintain pure concurrency and avoid waterfalling, we will pull _run_dns
-    # out.
     await _run_dns(domain, result)
     
     # Run all async sources concurrently
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=45.0, follow_redirects=True, verify=False) as client:
         tasks = [
-            _run_crtsh(client, domain, result),
-            _run_hackertarget(client, domain, result),
-            _run_rapiddns(client, domain, result),
-            _run_threatminer(client, domain, result),
-            _run_otx(client, domain, result),
-            _run_urlscan(client, domain, result),
-            _run_whois(domain, result),
-            _run_asn(client, domain, result),
+            _safe_run(_run_crtsh(client, domain, result), "crt.sh", timeout=90),
+            _safe_run(_run_whois(domain, result), "WHOIS", timeout=30),
+            _safe_run(_run_asn(client, domain, result), "ASN", timeout=20),
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -494,6 +454,7 @@ async def run_osint(target: str) -> dict:
     # shodan is a synchronous SDK network call.
     def run_sync_tools():
         _run_harvester(domain, result)
+        _run_amass(domain, result)
         _run_subfinder(domain, result)
         _run_shodan(domain, result)
         
@@ -509,5 +470,22 @@ async def run_osint(target: str) -> dict:
 
     # Print summary table
     _print_summary(result)
+    
+    # Save full raw data to file for visibility
+    reports_dir = os.path.join(os.getcwd(), "reports")
+    os.makedirs(reports_dir, exist_ok=True)
+    
+    # Save JSON dump
+    raw_file = os.path.join(reports_dir, f"{domain}_osint_raw.json")
+    with open(raw_file, "w") as f:
+        f.write(result.model_dump_json(indent=4))
+        
+    # Save raw subdomains as text file
+    subdomains_file = os.path.join(reports_dir, f"{domain}_subdomains.txt")
+    with open(subdomains_file, "w") as f:
+        f.write("\n".join(result.subdomains))
+        
+    console.print(f"\n[bold green]➜ Full raw OSINT data saved to:[/bold green] {raw_file}")
+    console.print(f"[bold green]➜ Raw subdomains saved to:[/bold green] {subdomains_file}")
 
     return result.model_dump()

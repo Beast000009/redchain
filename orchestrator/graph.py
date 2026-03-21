@@ -15,6 +15,7 @@ console = Console()
 class AgentState(TypedDict):
     target: str
     input_type: str  # domain, ip, cidr
+    wordlist: Optional[str] # for directory busting
     
     # Phase 1: OSINT
     osint_results: Dict[str, Any]
@@ -50,8 +51,15 @@ def osint_node(state: AgentState):
 
 def subdomain_node(state: AgentState):
     console.print(f"[bold blue][Subdomain Node][/bold blue] Enumerating subdomains for {state['target']}")
-    hostnames = state.get("osint_results", {}).get("hostnames", [])
-    subdomains = run_subdomain_enum(state["target"], hostnames)
+    
+    osint = state.get("osint_results", {})
+    hostnames = osint.get("hostnames", [])
+    subs = osint.get("subdomains", [])
+    
+    # Combine everything OSINT found
+    all_discovered = list(set(hostnames + subs))
+    
+    subdomains = run_subdomain_enum(state["target"], all_discovered)
     return {"subdomains": subdomains}
 
 def scanner_node(state: AgentState):
@@ -59,20 +67,29 @@ def scanner_node(state: AgentState):
     
     # Gather live hosts from previous steps if available
     live = state.get("live_hosts", [])
-    if not live:
-        # Extract from subdomains if domain step ran
-        for sub in state.get("subdomains", []):
-            if sub.get("alive") and sub.get("ip"):
-                live.append(sub.get("ip"))
-                
-    actual_live, scan_results = run_scanner(state["target"], state["input_type"], live)
-    return {"live_hosts": actual_live, "scan_results": scan_results}
-
 def cve_node(state: AgentState):
     console.print(f"[bold blue][CVE Node][/bold blue] Looking up CVEs for services...")
     findings = run_cve_lookup(state.get("scan_results", []))
     console.print(f"Found [red]{len(findings)}[/red] CVEs.")
     return {"cve_findings": findings}
+
+def scanner_node(state: AgentState):
+    console.print(f"[bold blue][Scanner Node][/bold blue] Running vulnerability scans...")
+    live = state.get("live_hosts", [])
+    if not live:
+        for sub in state.get("subdomains", []):
+            if sub.get("alive") and sub.get("ip"):
+                live.append(sub.get("ip"))
+                
+    import asyncio
+    actual_live, scan_results = asyncio.run(run_scanner(
+        state["target"], 
+        state["input_type"], 
+        live, 
+        state.get("wordlist"),
+        state.get("webapp_results", [])
+    ))
+    return {"live_hosts": actual_live, "scan_results": scan_results}
 
 def report_node(state: AgentState):
     console.print(f"[bold blue][Report Node][/bold blue] Generating AI narrative and PDF report...")
@@ -95,11 +112,25 @@ def route_initial(state: AgentState):
 
 # --- Build the Graph ---
 
+from agents.webapp_agent import run_webapp_fingerprint
+
+def webapp_node(state: AgentState):
+    console.print("[cyan][WebApp Node] Fingerprinting web services...[/cyan]")
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+    new_state = loop.run_until_complete(run_webapp_fingerprint(state))
+    return new_state
+
 workflow = StateGraph(AgentState)
 
 # Add Nodes
 workflow.add_node("osint", osint_node)
 workflow.add_node("subdomain", subdomain_node)
+workflow.add_node("webapp", webapp_node)
 workflow.add_node("scanner", scanner_node)
 workflow.add_node("cve", cve_node)
 workflow.add_node("report", report_node)
@@ -114,7 +145,8 @@ workflow.set_conditional_entry_point(
 )
 
 workflow.add_edge("osint", "subdomain")
-workflow.add_edge("subdomain", "scanner")
+workflow.add_edge("subdomain", "webapp")
+workflow.add_edge("webapp", "scanner")
 workflow.add_edge("scanner", "cve")
 workflow.add_edge("cve", "report")
 workflow.add_edge("report", END)
@@ -122,13 +154,14 @@ workflow.add_edge("report", END)
 # Compile graph
 app = workflow.compile()
 
-def run_workflow(target: str, input_type: str):
+def run_workflow(target: str, input_type: str, wordlist: Optional[str] = None):
     """"Entry point for cli.py to trigger the flow."""
     console.print(f"[bold green]Starting LangGraph Workflow for {target} ({input_type})[/bold green]")
     
     initial_state = AgentState(
         target=target,
         input_type=input_type,
+        wordlist=wordlist,
         osint_results={},
         subdomains=[],
         live_hosts=[],

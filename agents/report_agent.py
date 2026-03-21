@@ -32,10 +32,12 @@ def run_report_agent(state_data: Dict[str, Any]) -> Dict[str, str]:
         prompt = (
             f"Here are the findings:\n"
             f"Target: {state_data.get('target')}\n"
-            f"OSINT: {json.dumps(state_data.get('osint_results', {}))[:1000]}...\n" # Truncated to avoid huge limits if many results
+            f"OSINT: {json.dumps(state_data.get('osint_results', {}))[:1000]}...\n"
             f"Live Hosts: {state_data.get('live_hosts', [])}\n"
+            f"Web Fingerprints (Phase 2.5): {json.dumps(state_data.get('webapp_results', []))[:3000]}...\n"
             f"Scan Results: {json.dumps(state_data.get('scan_results', []))[:2000]}...\n"
             f"CVEs: {json.dumps(state_data.get('cve_findings', []))[:3000]}...\n"
+            f"\nEnsure to include a highly detailed Web App Fingerprinting section if Web Fingerprints are provided. Include interesting paths, WAFs detected, tech stack, and highlight risk flags in the executive summary."
         )
         
         response = client.models.generate_content(
