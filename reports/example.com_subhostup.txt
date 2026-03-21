@@ -1,5 +1,0 @@
-example.com
-m.testexample.com
-subjectname@example.com
-user@example.com
-www.example.com
