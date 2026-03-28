@@ -2,9 +2,14 @@ import asyncio
 import subprocess
 import socket
 import os
+import sys
 import httpx
 from typing import List, Dict, Any
 from rich.console import Console
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from utils import find_tool, get_ping_cmd, make_httpx_transport, IS_WINDOWS
+from config import run_config
 
 console = Console()
 
@@ -44,11 +49,12 @@ async def check_subdomain(sub: str, sem: asyncio.Semaphore) -> Dict[str, Any]:
         if ip:
             alive = True
             
-        # 2. Ping command (User requested fallback)
+        # 2. Ping command — cross-platform
         if not alive:
             try:
+                ping_cmd = get_ping_cmd(sub)
                 proc = await asyncio.create_subprocess_exec(
-                    "ping", "-c", "1", "-W", "1000", sub,
+                    *ping_cmd,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL
                 )

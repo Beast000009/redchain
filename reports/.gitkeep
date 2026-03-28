@@ -1,0 +1,2 @@
+# — keep this file so git tracks the empty reports/ directory —
+# Scan reports are generated here and ignored by .gitignore

@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "redchain"
+version = "2.0.0"
+description = "Autonomous AI Red Team Agent — LangGraph-powered penetration testing"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph",
+    "langchain-core",
+    "google-genai",
+    "python-nmap",
+    "dnspython",
+    "python-whois",
+    "shodan",
+    "typer",
+    "rich",
+    "pydantic",
+    "pydantic-settings",
+    "jinja2",
+    "weasyprint",
+    "httpx",
+    "beautifulsoup4",
+    "ipinfo",
+    "packaging",
+    "python-dotenv",
+]
+
+[project.scripts]
+redchain = "redchain_cli:main"
+
+[tool.setuptools]
+py-modules = ["cli", "config", "utils", "models", "redchain_cli"]
+
+[tool.setuptools.packages.find]
+include = ["orchestrator*", "agents*", "llm*", "i18n*", "plugins*", "report*", "tools*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501", "F401", "E722"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_functions = "test_*"

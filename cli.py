@@ -1,8 +1,14 @@
+#!/usr/bin/env python3
 import os
 import sys
 
-# macOS Homebrew Library Path Fallback (Essential for WeasyPrint/Pango)
-os.environ['DYLD_FALLBACK_LIBRARY_PATH'] = '/opt/homebrew/lib:' + os.environ.get('DYLD_FALLBACK_LIBRARY_PATH', '')
+# Add the project root to sys.path early so utils can be found
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
+from utils import IS_MAC, IS_LINUX, IS_WINDOWS, IS_WSL, find_tool, require_sudo, setup_platform_env
+
+# Platform-guarded environment setup (only sets DYLD on macOS)
+setup_platform_env()
 
 import typer
 import json
@@ -13,26 +19,126 @@ from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
 import shutil
-import platform
 
-PLATFORM = platform.system()
-IS_MAC = PLATFORM == "Darwin"
-IS_LINUX = PLATFORM == "Linux"
-IS_WINDOWS = PLATFORM == "Windows"
-
-def find_tool(name: str) -> str | None:
-    return shutil.which(name)
-
-def require_sudo() -> bool:
-    return os.geteuid() == 0 if not IS_WINDOWS else False
-
-# Add the project root to sys.path so modules can find each other
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
-
-from config import run_config
+from config import run_config, settings
+from i18n import SUPPORTED_LANGUAGES
 
 app = typer.Typer(help="RedChain - Autonomous AI Red Team Agent")
 console = Console()
+
+MANUAL_PAGE = """
+[bold cyan]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold cyan]
+[bold red]  🔴 REDCHAIN v2.0 — MANUAL[/bold red]
+[bold cyan]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold cyan]
+
+[bold]NAME[/bold]
+    redchain — Autonomous AI Red Team Agent
+
+[bold]SYNOPSIS[/bold]
+    redchain scan [OPTIONS]
+    redchain update
+    redchain man
+
+[bold]COMMANDS[/bold]
+    [green]scan[/green]        Run the full pentest pipeline on targets
+    [green]update[/green]      Update external tools (nmap, nikto, gobuster, etc.)
+    [green]man[/green]         Show this manual page
+
+[bold]SCAN OPTIONS[/bold]
+    [yellow]-t, --target[/yellow]        TARGET    Single target: domain, IP, CIDR, or URL
+    [yellow]-f, --file[/yellow]          PATH      File with one target per line
+    [yellow]-o, --output[/yellow]        FORMAT    Output: pdf | md | json | csv | both (default: both)
+    [yellow]-s, --stealth[/yellow]                 Enable stealth mode (slow scan, low footprint)
+    [yellow]-c, --config[/yellow]        PATH      Path to custom .env config file
+    [yellow]-w, --wordlist[/yellow]      PATH      Wordlist for directory brute-forcing
+    [yellow]-l, --language[/yellow]      LANG      Report language: en es fr de ja zh ar pt ko hi
+    [yellow]-p, --profile[/yellow]       PROFILE   Scan profile: quick | full | stealth | compliance
+    [yellow]--ports[/yellow]             N         Nmap port count: 50 | 100 | 200 | 1000 (default: auto)
+    [yellow]--llm-provider[/yellow]      PROVIDER  AI backend: gemini | openai | ollama
+    [yellow]--llm-model[/yellow]         MODEL     Override LLM model (e.g. gpt-4o, llama3.1)
+    [yellow]--threads[/yellow]           N         Concurrency limit (default: 10)
+    [yellow]--proxy[/yellow]             URL       HTTP/SOCKS5 proxy (e.g. socks5://127.0.0.1:9050)
+    [yellow]--no-scope-check[/yellow]              Bypass scope.json validation
+
+[bold]PORT SCANNING MODES[/bold]
+    [green]--ports 50[/green]    ⚡ Fast — top 50 ports (~30 sec per host)
+    [green]--ports 100[/green]   🔄 Standard — top 100 ports (~1 min per host)
+    [green]--ports 200[/green]   📋 Deep — top 200 ports (~2 min per host)
+    [green]--ports 1000[/green]  🔬 Full — all 1000 nmap ports (~5-10 min per host)
+    [dim]Default: auto (50 for quick, 100 for stealth, 200 for full/compliance)[/dim]
+
+[bold]SCAN PROFILES[/bold]
+    [green]quick[/green]       ⚡ Fast recon — skip OSINT, top-50 ports
+    [green]full[/green]        🔄 All 6 phases enabled, top-200 ports (default)
+    [green]stealth[/green]     🐢 Slow scans, WAF evasion, top-100 ports
+    [green]compliance[/green]  📋 Full scan + OWASP/NIST mapping, top-200 ports
+
+[bold]LLM PROVIDERS[/bold]
+    [green]gemini[/green]      Google Gemini (default) — requires GEMINI_API_KEY
+    [green]openai[/green]      OpenAI / Azure — requires OPENAI_API_KEY
+    [green]ollama[/green]      Local Ollama — no API key, works offline/air-gapped
+
+[bold]PIPELINE PHASES[/bold]
+    1. [cyan]OSINT[/cyan]           theHarvester, crt.sh, Amass, Subfinder, Shodan, Dorks
+    2. [cyan]Subdomain[/cyan]       Multi-tool discovery + alive-host validation
+    3. [cyan]WebApp[/cyan]          WhatWeb, Nikto, Gobuster, WAF detection (wafw00f)
+    4. [cyan]Scanner[/cyan]         Nmap deep scan + service version detection
+    5. [cyan]CVE[/cyan]             NVD, Vulners, cvemap — auto CVE-to-service matching
+    6. [cyan]Report[/cyan]          AI kill chain narrative + PDF/MD/JSON/CSV generation
+
+[bold]EXAMPLES[/bold]
+    [dim]# Basic domain scan[/dim]
+    redchain scan -t example.com --no-scope-check
+
+    [dim]# Quick scan with top-50 ports (fastest)[/dim]
+    redchain scan -t target.com --profile quick --no-scope-check
+
+    [dim]# Deep scan with all 1000 ports[/dim]
+    redchain scan -t target.com --ports 1000 --no-scope-check
+
+    [dim]# Scan IP range with stealth profile[/dim]
+    redchain scan -t 10.0.0.0/24 --profile stealth --proxy socks5://127.0.0.1:9050
+
+    [dim]# Scan with OpenAI and Japanese reports[/dim]
+    redchain scan -t target.com --llm-provider openai --language ja
+
+    [dim]# Offline scan with Ollama (air-gapped)[/dim]
+    redchain scan -t target.com --llm-provider ollama --llm-model llama3.1
+
+    [dim]# Compliance audit with CSV export[/dim]
+    redchain scan -t target.com --profile compliance --output csv
+
+    [dim]# Scan from file with custom wordlist[/dim]
+    redchain scan -f targets.txt -w /usr/share/seclists/Discovery/Web-Content/big.txt
+
+    [dim]# Docker scan[/dim]
+    docker run --rm -v ./reports:/app/reports --env-file .env redchain scan -t target.com
+
+[bold]ENVIRONMENT VARIABLES[/bold]
+    GEMINI_API_KEY        Google Gemini API key
+    OPENAI_API_KEY        OpenAI API key
+    SHODAN_API_KEY        Shodan API key
+    VULNERS_API_KEY       Vulners API key
+    NVD_API_KEY           NVD API key (recommended for rate limits)
+    VIRUSTOTAL_API_KEY    VirusTotal threat intel
+    ABUSEIPDB_API_KEY     AbuseIPDB threat intel
+    GREYNOISE_API_KEY     GreyNoise threat intel
+
+[bold]FILES[/bold]
+    .env                  API keys configuration
+    scope.json            Authorized targets definition
+    reports/              Generated report output directory
+    ~/.redchain/plugins/  Community plugin directory
+
+[bold cyan]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold cyan]
+"""
+
+
+@app.command()
+def man():
+    """Show the full RedChain manual with all commands, options, and examples."""
+    console.print(MANUAL_PAGE)
+
 
 def classify_target(target: str) -> str:
     """Classifies the target as domain, ip, cidr, or url."""
@@ -61,7 +167,7 @@ def classify_target(target: str) -> str:
     return "domain"
 
 def validate_scope(target: str, scope_file: str) -> bool:
-    """Validates the target against the scope.json file."""
+    """Validates the target against the scope.json file (supports CIDR, wildcards, exclusions)."""
     if not os.path.exists(scope_file):
         console.print(f"[bold yellow]Warning:[/bold yellow] Scope file '{scope_file}' not found.")
         return False
@@ -69,18 +175,32 @@ def validate_scope(target: str, scope_file: str) -> bool:
     try:
         with open(scope_file, "r") as f:
             scope_data = json.load(f)
-            
+
         allowed_targets = scope_data.get("allowed", [])
-        
-        # Simple string matching for now (can be expanded to regex/CIDR matching)
+        excluded_targets = scope_data.get("excluded", [])
+
+        # Check exclusions first
+        for excl in excluded_targets:
+            if target == excl or target.endswith("." + excl):
+                console.print(f"[bold red]Target '{target}' is explicitly EXCLUDED in scope.json[/bold red]")
+                return False
+
+        # Exact match
         if target in allowed_targets:
             return True
-        
-        # Check against subdomains if allowed specifies a domain
+
         for allowed in allowed_targets:
+            # Wildcard: *.example.com
+            if allowed.startswith("*."):
+                parent = allowed[2:]
+                if target.endswith("." + parent) or target == parent:
+                    return True
+                continue
+
+            # Subdomain: target is a subdomain of allowed
             if target.endswith("." + allowed) or target == allowed:
                 return True
-                
+
         # Check if target IP is in allowed CIDR
         try:
             target_ip = ipaddress.ip_address(target)
@@ -119,12 +239,19 @@ def update():
         console.print("[yellow]Updating Ruby tools (whatweb) via gem...[/yellow]")
         os.system("sudo gem install whatweb")
         
-    console.print("[yellow]Updating Go tools (gobuster, cvemap)...[/yellow]")
+    console.print("[yellow]Updating Go tools (gobuster, cvemap, subfinder, nuclei)...[/yellow]")
     if not IS_MAC or not find_tool("gobuster"):
         os.system("go install github.com/OJ/gobuster/v3@latest")
-        
+
     os.system("go install github.com/projectdiscovery/cvemap/cmd/cvemap@latest")
-    
+    os.system("go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest")
+    os.system("go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest")
+
+    # Update nuclei templates
+    if find_tool("nuclei"):
+        console.print("[yellow]Updating nuclei templates...[/yellow]")
+        os.system("nuclei -update-templates -silent")
+
     console.print("[bold green]Tools update complete![/bold green]")
 
 def check_for_updates():
@@ -149,7 +276,6 @@ def check_for_updates():
     except Exception as e:
         console.print(f"[dim]Could not check for updates online: {e}[/dim]")
 
-import shutil
 from rich.table import Table
 
 def check_dependencies():
@@ -181,10 +307,17 @@ def check_dependencies():
             missing = True
             
     # Optional tools
-    if shutil.which("cvemap"):
-        table.add_row("[green]✓[/green]", "cvemap (Optional)", "Fast local CVE Lookups")
-    else:
-        table.add_row("[yellow]-[/yellow]", "[yellow]cvemap (Optional)[/yellow]", "Fast local CVE Lookups (using fallback APIs)")
+    optional_tools = {
+        "cvemap":  "Fast local CVE Lookups",
+        "nuclei":  "Templated Vuln Scanning (7000+ templates)",
+        "testssl.sh": "SSL/TLS Deep Analysis",
+        "paramiko": "SSH credential testing (pip)",
+    }
+    for tool, desc in optional_tools.items():
+        if shutil.which(tool):
+            table.add_row("[green]✓[/green]", f"{tool} (Optional)", desc)
+        else:
+            table.add_row("[yellow]-[/yellow]", f"[yellow]{tool} (Optional)[/yellow]", f"{desc} (not installed)")
             
     console.print(table)
     if not shutil.which("cvemap"):
@@ -195,15 +328,48 @@ def check_dependencies():
     else:
         console.print("[green]All required dependencies met![/green]\n")
 
+# ── Scan Profiles ─────────────────────────────────────────────────────────────
+
+SCAN_PROFILES = {
+    "quick": {
+        "description": "Fast scan — skip OSINT, minimal nmap",
+        "stealth": False,
+        "threads": 20,
+    },
+    "full": {
+        "description": "Full pipeline — all phases enabled",
+        "stealth": False,
+        "threads": 10,
+    },
+    "stealth": {
+        "description": "Stealth mode — slow scans, WAF-aware",
+        "stealth": True,
+        "threads": 5,
+    },
+    "compliance": {
+        "description": "Compliance scan — OWASP/NIST mapping focus",
+        "stealth": False,
+        "threads": 10,
+    },
+}
+
+
 @app.command()
 def scan(
     target: Optional[str] = typer.Option(None, "--target", "-t", help="Single target (domain, IP, CIDR, URL)"),
     file: Optional[Path] = typer.Option(None, "--file", "-f", help="Path to targets.txt"),
-    output: str = typer.Option("both", "--output", "-o", help="Output format: pdf | md | both"),
+    output: str = typer.Option("both", "--output", "-o", help="Output format: pdf | md | json | csv | both"),
     stealth: bool = typer.Option(False, "--stealth", "-s", help="Enable stealth mode (slower scan)"),
     config_path: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to custom .env config"),
     no_scope_check: bool = typer.Option(False, "--no-scope-check", help="Bypass scope validation"),
     wordlist: Optional[Path] = typer.Option(None, "--wordlist", "-w", help="Path to wordlist for directory busting"),
+    llm_provider: str = typer.Option("gemini", "--llm-provider", help="LLM provider: gemini | openai | ollama"),
+    llm_model: Optional[str] = typer.Option(None, "--llm-model", help="Override default LLM model name"),
+    language: str = typer.Option("en", "--language", "-l", help="Report language (en, es, fr, de, ja, zh, ar, pt, ko, hi)"),
+    threads: int = typer.Option(10, "--threads", help="Concurrency limit for parallel operations"),
+    profile: str = typer.Option("full", "--profile", "-p", help="Scan profile: quick | full | stealth | compliance"),
+    proxy: Optional[str] = typer.Option(None, "--proxy", help="HTTP/SOCKS5 proxy for outbound traffic"),
+    ports: int = typer.Option(0, "--ports", help="Nmap port count: 50 | 100 | 200 | 1000 (0=auto based on profile)"),
 ):
     """
     Run the RedChain autonomous pentest on targets.
@@ -212,12 +378,37 @@ def scan(
     check_for_updates()
     
     if config_path and config_path.exists():
-        # Update settings logic if custom config provided (using python-dotenv could be simpler here)
         from dotenv import load_dotenv
         load_dotenv(config_path)
 
+    # Apply scan profile defaults
+    if profile in SCAN_PROFILES:
+        profile_cfg = SCAN_PROFILES[profile]
+        if not stealth:
+            stealth = profile_cfg.get("stealth", False)
+        threads = threads or profile_cfg.get("threads", 10)
+        console.print(f"[cyan]Using scan profile: {profile} — {profile_cfg['description']}[/cyan]")
+
+    # Apply runtime config
     run_config.output_format = output
     run_config.stealth = stealth
+    run_config.llm_provider = llm_provider
+    run_config.llm_model = llm_model
+    run_config.language = language
+    run_config.threads = threads
+    run_config.profile = profile
+    run_config.proxy = proxy
+    run_config.ports = ports
+
+    # Validate language
+    if language not in SUPPORTED_LANGUAGES:
+        console.print(f"[yellow]Warning: Language '{language}' not fully supported. Falling back to English.[/yellow]")
+        run_config.language = "en"
+
+    # Set proxy — store in run_config; agents use make_httpx_transport(proxy) for proper httpx support
+    # Note: setting HTTP_PROXY/HTTPS_PROXY env vars does NOT work for httpx AsyncClient
+    if proxy:
+        console.print(f"[cyan]Using proxy: {proxy} (agents will route via httpx transport or proxychains)[/cyan]")
 
     targets_to_scan = []
     if target:
@@ -244,7 +435,12 @@ def scan(
             if not current_target:
                 current_target = parsed.path.split('/')[0]
 
-        console.print(Panel.fit(f"Starting RedChain against [bold cyan]{current_target}[/bold cyan] ({target_type})", title="RedChain Init"))
+        console.print(Panel.fit(
+            f"Starting RedChain against [bold cyan]{current_target}[/bold cyan] ({target_type})\n"
+            f"[dim]Provider: {llm_provider} | Language: {SUPPORTED_LANGUAGES.get(language, language)} | "
+            f"Profile: {profile} | Threads: {threads}[/dim]",
+            title="RedChain Init"
+        ))
 
         if not no_scope_check:
             is_valid = validate_scope(current_target, "scope.json")
@@ -254,10 +450,8 @@ def scan(
                     console.print("[yellow]Skipping target.[/yellow]")
                     continue
 
-        # TODO: Launch workflow
         console.print("[cyan]Target validated, launching orchestrator...[/cyan]")
         
-        # Run workflow:
         from orchestrator.graph import run_workflow
         run_workflow(current_target, target_type, wordlist_str)
 

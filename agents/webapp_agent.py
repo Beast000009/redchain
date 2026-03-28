@@ -5,29 +5,18 @@ import re
 import time
 import shutil
 import os
+import sys
 from pathlib import Path
 from typing import Optional
 import httpx
 from rich.console import Console
 from rich.table import Table
 from pydantic import BaseModel, Field, field_validator
-import platform
 
-PLATFORM = platform.system()
-IS_MAC = PLATFORM == "Darwin"
-IS_LINUX = PLATFORM == "Linux"
-IS_WINDOWS = PLATFORM == "Windows"
-
-def find_tool(name: str) -> str | None:
-    return shutil.which(name)
-
-def require_sudo() -> bool:
-    return os.geteuid() == 0 if not IS_WINDOWS else False
-
-try:
-    from config import run_config as settings
-except ImportError:
-    pass
+# Setup import from project root
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from utils import find_tool, require_sudo
+from config import run_config as settings
 
 console = Console()
 
@@ -341,12 +330,16 @@ def _run_nikto(url: str, result: WebAppResult) -> None:
         result.scan_errors["nikto"] = str(e)
 
 
-def _run_gobuster(url: str, domain: str, result: WebAppResult) -> None:
+def _run_gobuster(url: str, domain: str, result: WebAppResult, user_wordlist: str = None) -> None:
     """Dir + file + vhost brute force."""
     gobuster_path = find_tool("gobuster")
     if not gobuster_path: return
 
     def _resolve_wordlist() -> str:
+        # If user provided -w flag, use that first
+        if user_wordlist and os.path.exists(user_wordlist):
+            return user_wordlist
+        
         candidates = [
             "/usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt",
             "/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt", 
@@ -528,36 +521,42 @@ def _aggregate_results(result: WebAppResult) -> None:
 async def run_webapp_fingerprint(state: dict) -> dict:
     """
     Phase 2.5 — web app fingerprinting.
-    Reads: state["subdomains"] + state["live_hosts"]
+    Reads: state["target"] + state["subdomains"] + state["live_hosts"]
     Writes: state["webapp_results"]
     """
     hosts_input = state.get("live_hosts", [])
     subdomains_input = state.get("subdomains", [])
+    domain = state.get("target", "")
     
-    # Build list of dicts with {ip: ip, subdomain: sub} structure expected by prompt
+    # Build list of dicts with {ip: ip, subdomain: sub} structure
     hosts = []
+    
+    # ── Always include the primary domain first ──────────────────────────
+    if domain:
+        hosts.append({"subdomain": domain})
     
     # Process from live_hosts (IPs)
     for host in hosts_input:
-        hosts.append({"ip": host})
+        if not any(h.get("ip") == host or h.get("subdomain") == host for h in hosts):
+            hosts.append({"ip": host})
         
     # Process from subdomains
     for sub in subdomains_input:
         if sub.get("alive"): # Only take alive subdomains
-            # Make sure we don't duplicate
-            if not any(h.get("subdomain") == sub.get("subdomain") for h in hosts):
-                 hosts.append({"ip": sub.get("ip"), "subdomain": sub.get("subdomain")})
+            sub_name = sub.get("subdomain")
+            # Make sure we don't duplicate (also skip if same as primary domain)
+            if sub_name and sub_name != domain and not any(h.get("subdomain") == sub_name for h in hosts):
+                 hosts.append({"ip": sub.get("ip"), "subdomain": sub_name})
     
     # If hosts is empty, directly return
     if not hosts:
         state["webapp_results"] = []
         return state
 
-    domain = state.get("target", "")
     results: list[WebAppResult] = []
 
     console.rule("[bold red]Phase 2.5 — Web App Fingerprinting[/bold red]")
-    console.print(f"[dim]Fingerprinting {len(hosts)} live hosts concurrently[/dim]\n")
+    console.print(f"[dim]Fingerprinting {len(hosts)} live hosts (including primary domain)[/dim]\n")
 
     def _process_host(host_info: dict) -> Optional[WebAppResult]:
         host = host_info.get("subdomain") or host_info.get("ip")
@@ -584,7 +583,7 @@ async def run_webapp_fingerprint(state: dict) -> dict:
         # Step 1: WAF check (always first)
         _run_wafw00f(active_url, res)
         waf_str = f"[red]WAF: {res.waf.waf_name}[/red]" if res.waf and res.waf.detected else "[green]No WAF[/green]"
-        console.print(f"  [{host}] wafw00f ........... {waf_str}")
+        console.print(f"   wafw00f ........... {waf_str}")
 
         # Step 2: WhatWeb
         _run_whatweb(active_url, res)
@@ -597,22 +596,36 @@ async def run_webapp_fingerprint(state: dict) -> dict:
              if temps:
                  tech = ", ".join(temps[:4])
                  
-        console.print(f"  [{host}] whatweb ........... {tech}")
+        console.print(f"   whatweb ........... {tech}")
 
         # Step 3: Nikto
         _run_nikto(active_url, res)
-        console.print(f"  [{host}] nikto ............. {len(res.nikto_findings)} findings")
+        console.print(f"   nikto ............. {len(res.nikto_findings)} findings")
+        # Print individual nikto findings to terminal
+        for nf in res.nikto_findings:
+            severity_color = "red" if nf.category == "vuln" else "yellow" if nf.category == "misconfig" else "dim"
+            console.print(f"     [{severity_color}]→ {nf.url or '/'}: {nf.description[:120]}[/{severity_color}]")
 
-        # Step 4: Gobuster
-        _run_gobuster(active_url, domain, res)
-        console.print(f"  [{host}] gobuster .......... {len(res.gobuster_dirs)} dirs, {len(res.gobuster_files)} files")
+        # Step 4: Gobuster (pass user wordlist from state)
+        user_wl = state.get("wordlist")
+        _run_gobuster(active_url, domain, res, user_wordlist=user_wl)
+        console.print(f"   gobuster .......... {len(res.gobuster_dirs)} dirs, {len(res.gobuster_files)} files")
+        # Print discovered directories/files to terminal
+        for gf in res.gobuster_dirs[:20]:
+            tag = "[green]★[/green]" if gf.is_interesting else " "
+            console.print(f"     {tag} [cyan]{gf.path}[/cyan] ({gf.status_code}) [{gf.size}B]{' → ' + gf.redirect_to if gf.redirect_to else ''}")
+        for gf in res.gobuster_files[:10]:
+            tag = "[green]★[/green]" if gf.is_interesting else " "
+            console.print(f"     {tag} [magenta]{gf.path}[/magenta] ({gf.status_code}) [{gf.size}B]")
+        if len(res.gobuster_dirs) > 20 or len(res.gobuster_files) > 10:
+            console.print(f"     [dim]... and {max(0, len(res.gobuster_dirs)-20) + max(0, len(res.gobuster_files)-10)} more[/dim]")
 
         # Aggregate and flag
         _aggregate_results(res)
 
         if res.risk_flags:
             for flag in res.risk_flags:
-                console.print(f"  [{host}] [yellow]  ! {flag}[/yellow]")
+                console.print(f"   [yellow]⚠ {flag}[/yellow]")
                 
         return res
 

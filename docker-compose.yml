@@ -1,0 +1,21 @@
+# ─── RedChain Docker Compose ────────────────────────────────────────────────
+# Usage:
+#   docker compose run --rm redchain scan -t target.com --no-scope-check
+#   docker compose run --rm redchain update
+# ────────────────────────────────────────────────────────────────────────────
+
+services:
+  redchain:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    volumes:
+      # Mount reports directory for output persistence
+      - ./reports:/app/reports
+      # Mount scope.json if it exists
+      - ./scope.json:/app/scope.json:ro
+    network_mode: host
+    stdin_open: true
+    tty: true

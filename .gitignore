@@ -1,0 +1,63 @@
+# ─── RedChain .gitignore ─────────────────────────────────────────────────────
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables (contains API keys — NEVER commit!)
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Reports (generated per-scan, don't commit real scan data)
+reports/*.json
+reports/*.md
+reports/*.csv
+reports/*.pdf
+reports/*.txt
+
+# Temp files from scans
+/tmp/gobuster_*
+/tmp/nikto_*
+/tmp/redchain_wordlist.txt
+
+# Pytest / coverage
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Jupyter notebooks (scratch files)
+*.ipynb
+.ipynb_checkpoints/
+.virtual_documents/
+
+# Anaconda / Jupyter artifacts
+anaconda_projects/
+
+# Go build cache (if building locally)
+go.sum
+vendor/
+
+# macOS quarantine attributes
+*.xattr

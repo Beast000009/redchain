@@ -9,32 +9,19 @@ from datetime import datetime
 import httpx
 import dns.resolver
 import dns.zone
+import dns.query
 import whois
 import shodan
-import ipinfo
-from bs4 import BeautifulSoup
 from rich.console import Console
 from rich.table import Table
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional
-import platform
-import shutil
-
-PLATFORM = platform.system()
-IS_MAC = PLATFORM == "Darwin"
-IS_LINUX = PLATFORM == "Linux"
-IS_WINDOWS = PLATFORM == "Windows"
-
-def find_tool(name: str) -> str | None:
-    return shutil.which(name)
-
-def require_sudo() -> bool:
-    return os.geteuid() == 0 if not IS_WINDOWS else False
 
 # Setup import from project root
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from config import settings
+from config import settings, run_config
+from utils import find_tool, require_sudo, make_httpx_transport
 
 console = Console()
 
@@ -135,33 +122,9 @@ def _run_harvester(domain: str, result: OsintResult):
         result.errors["theHarvester"] = str(e)
         console.print(f"[yellow]✗[/yellow] [gray]theHarvester[/gray]: {e}")
 
-def _run_subfinder(domain: str, result: OsintResult):
-    try:
-        proc = subprocess.run(
-            ["subfinder", "-d", domain, "-silent", "-json"],
-            capture_output=True, text=True, timeout=60
-        )
-        if proc.returncode == 0:
-            count = 0
-            for line in proc.stdout.splitlines():
-                if line.strip():
-                    try:
-                        data = json.loads(line)
-                        host = data.get("host")
-                        if host:
-                            result.subdomains.append(host.lower())
-                            count += 1
-                    except json.JSONDecodeError:
-                        result.subdomains.append(line.strip().lower())
-                        count += 1
-            result.sources_used.append("subfinder")
-            console.print(f"[green]✓[/green] [gray]subfinder[/gray]: {count} subdomains")
-    except FileNotFoundError:
-        console.print(f"[yellow]![/yellow] [gray]subfinder[/gray]: Not installed in PATH")
-        result.errors["subfinder"] = "Not in PATH"
-    except Exception as e:
-        result.errors["subfinder"] = str(e)
-        console.print(f"[yellow]✗[/yellow] [gray]subfinder[/gray]: {e}")
+# NOTE: subfinder is intentionally NOT called here.
+# subdomain_agent.py runs subfinder to avoid double API calls.
+# osint_agent focuses on passive sources (crt.sh, theHarvester, amass, shodan).
 
 async def _run_crtsh(client: httpx.AsyncClient, domain: str, result: OsintResult):
     headers = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
@@ -249,18 +212,34 @@ async def _run_dns(domain: str, result: OsintResult):
                 result.dkim_selectors_found.append(sel)
             except Exception: pass
             
-        # AXFR
+        # AXFR — Zone Transfer attempt
         def attempt_axfr():
+            axfr_records = []
             for ns in results["NS"]:
                 try:
                     ns_ips = dns.resolver.resolve(ns, "A")
                     for ns_ip in ns_ips:
                         try:
-                            z = dns.zone.from_xfr(dns.query.xfr(ns_ip.to_text(), domain, timeout=2))
-                            # Success! We won't dump the whole zone to avoid blowing up the struct
+                            z = dns.zone.from_xfr(dns.query.xfr(ns_ip.to_text(), domain, timeout=3))
+                            # ── CRITICAL FINDING: capture all records ──────────
+                            for name, node in z.nodes.items():
+                                rdatasets = node.rdatasets
+                                for rdataset in rdatasets:
+                                    for rdata in rdataset:
+                                        record_name = str(name) + '.' + domain if str(name) != '@' else domain
+                                        axfr_records.append(record_name)
+                                        # Populate subdomains from zone
+                                        if record_name.endswith(domain) and record_name != domain:
+                                            result.subdomains.append(record_name.lower())
+                            if axfr_records:
+                                result.errors["AXFR"] = "SUCCESS — Zone transfer possible!"
+                                result.sources_used.append("AXFR (CRITICAL: zone transfer succeeded!)")  
+                                console.print(f"[bold red]⚠ AXFR SUCCESS on {ns} ({ns_ip.to_text()}) — {len(axfr_records)} records captured![/bold red]")
                             return
-                        except Exception: pass
-                except Exception: pass
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
         await asyncio.to_thread(attempt_axfr)
 
         result.sources_used.append("DNS")
@@ -428,6 +407,31 @@ def _print_summary(r: OsintResult):
     console.print(table)
 
 
+# ── Passive DNS history (HackerTarget PDNS API — free, no key) ───────────────
+
+async def _run_passive_dns(client: httpx.AsyncClient, domain: str, result: OsintResult):
+    """Fetch passive DNS history via HackerTarget (free) and SecurityTrails (if key)."""
+    try:
+        url = f"https://api.hackertarget.com/hostsearch/?q={domain}"
+        res = await client.get(url, timeout=15)
+        if res.status_code == 200 and "error" not in res.text.lower():
+            entries = []
+            for line in res.text.strip().splitlines():
+                parts = line.split(",")
+                if len(parts) >= 2:
+                    sub = parts[0].strip().lower()
+                    ip_hist = parts[1].strip()
+                    if sub.endswith(domain):
+                        result.subdomains.append(sub)
+                        entries.append({"host": sub, "ip": ip_hist})
+            result.passive_dns_history.extend(entries)
+            if entries:
+                result.sources_used.append("HackerTarget PDNS")
+                console.print(f"[green]✓[/green] [gray]Passive DNS[/gray]: {len(entries)} historical records")
+    except Exception as e:
+        result.errors["passive_dns"] = str(e)
+
+
 # ── Main agent entry point ────────────────────────────────────────────────────
 
 async def run_osint(target: str) -> dict:
@@ -435,30 +439,50 @@ async def run_osint(target: str) -> dict:
     console.rule(f"[bold red]OSINT — {domain}[/bold red]")
     result = OsintResult(domain=domain)
 
-    # Note: ASN lookup requires an IP. We must run DNS lookup first 
+    # Note: ASN lookup requires an IP. We must run DNS lookup first
     await _run_dns(domain, result)
-    
+
+    # Build httpx client (proxy-aware)
+    proxy = getattr(run_config, 'proxy', None)
+    transport = make_httpx_transport(proxy)
+    client_kwargs = dict(timeout=45.0, follow_redirects=True, verify=False)
+    if transport:
+        client_kwargs["transport"] = transport
+
     # Run all async sources concurrently
-    async with httpx.AsyncClient(timeout=45.0, follow_redirects=True, verify=False) as client:
+    async with httpx.AsyncClient(**client_kwargs) as client:
         tasks = [
             _safe_run(_run_crtsh(client, domain, result), "crt.sh", timeout=90),
             _safe_run(_run_whois(domain, result), "WHOIS", timeout=30),
             _safe_run(_run_asn(client, domain, result), "ASN", timeout=20),
+            _safe_run(_run_passive_dns(client, domain, result), "Passive DNS", timeout=20),
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
 
     # Sequential tools (subprocess / sync SDKs)
-    
-    # Needs to be wrapped in thread since they are blocking calls requested by user
-    # to be called cleanly. theHarvester/subfinder are subprocesses, which block. 
-    # shodan is a synchronous SDK network call.
+    # theHarvester + amass + shodan are blocking — run in thread pool
     def run_sync_tools():
         _run_harvester(domain, result)
         _run_amass(domain, result)
-        _run_subfinder(domain, result)
         _run_shodan(domain, result)
-        
+
     await asyncio.to_thread(run_sync_tools)
+
+    # ── Threat Intel (VirusTotal, AbuseIPDB, GreyNoise) ─────────────────────
+    try:
+        from agents.threat_intel import run_threat_intel
+        threat_data = await run_threat_intel(domain)
+        result.errors["threat_intel"] = json.dumps(threat_data)  # reuse errors dict for storage
+        # Surface key threat signals
+        vt = threat_data.get("virustotal", {})
+        if vt.get("malicious", 0) > 0:
+            console.print(f"[red]⚠ VirusTotal: {vt['malicious']} malicious detections[/red]")
+        gn = threat_data.get("greynoise", {})
+        if gn.get("classification") in ("malicious", "suspicious"):
+            console.print(f"[red]⚠ GreyNoise: classified as {gn['classification']}[/red]")
+        result.sources_used.append("ThreatIntel (VT/AbuseIPDB/GreyNoise)")
+    except Exception as e:
+        console.print(f"[dim]Threat intel skipped: {e}[/dim]")
 
     # Dork generation (instant, no I/O)
     _generate_dorks(domain, result)
@@ -470,21 +494,21 @@ async def run_osint(target: str) -> dict:
 
     # Print summary table
     _print_summary(result)
-    
+
     # Save full raw data to file for visibility
     reports_dir = os.path.join(os.getcwd(), "reports")
     os.makedirs(reports_dir, exist_ok=True)
-    
+
     # Save JSON dump
     raw_file = os.path.join(reports_dir, f"{domain}_osint_raw.json")
     with open(raw_file, "w") as f:
         f.write(result.model_dump_json(indent=4))
-        
+
     # Save raw subdomains as text file
     subdomains_file = os.path.join(reports_dir, f"{domain}_subdomains.txt")
     with open(subdomains_file, "w") as f:
         f.write("\n".join(result.subdomains))
-        
+
     console.print(f"\n[bold green]➜ Full raw OSINT data saved to:[/bold green] {raw_file}")
     console.print(f"[bold green]➜ Raw subdomains saved to:[/bold green] {subdomains_file}")
 

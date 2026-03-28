@@ -4,29 +4,19 @@ from tools.nmap_wrapper import run_nmap_scan
 import ipaddress
 import subprocess
 import httpx
+import time
 from rich.console import Console
 from packaging.version import Version, InvalidVersion
 import json
-import platform
 import shutil
 import nmap
 import os
+import sys
 
-PLATFORM = platform.system()
-IS_MAC = PLATFORM == "Darwin"
-IS_LINUX = PLATFORM == "Linux"
-IS_WINDOWS = PLATFORM == "Windows"
-
-def find_tool(name: str) -> str | None:
-    return shutil.which(name)
-
-def require_sudo() -> bool:
-    return os.geteuid() == 0 if not IS_WINDOWS else False
-
-try:
-    from config import run_config
-except ImportError:
-    pass
+# Setup import from project root
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from utils import find_tool, require_sudo, IS_WINDOWS, get_temp_path, get_redchain_home, get_proxychains_prefix, make_httpx_transport
+from config import run_config
 
 console = Console()
 
@@ -79,8 +69,8 @@ class ServiceExploits(BaseModel):
     highest_risk: str = "none"  # remote/local/dos/none
     notes: list[str] = []       # human readable risk notes
 
-import nmap
-from config import run_config
+
+
 
 def grab_banner(ip: str, port: int, timeout: int = 2) -> str:
     """Attempts to grab a basic banner using raw sockets."""
@@ -103,20 +93,47 @@ import io
 _EXPLOIT_DB_CSV = None
 
 async def _fetch_exploit_db_csv() -> list[dict]:
+    """
+    Fetch (or load from disk cache) the ExploitDB files_exploits.csv.
+    Cache is stored at ~/.redchain/exploitdb.csv and refreshed every 24h.
+    """
     global _EXPLOIT_DB_CSV
     if _EXPLOIT_DB_CSV is not None:
         return _EXPLOIT_DB_CSV
-        
+
+    # ── Try disk cache first ─────────────────────────────────────────────────
+    cache_path = get_redchain_home() / "exploitdb.csv"
+    cache_ttl_seconds = 24 * 3600  # 24 hours
+
+    if cache_path.exists():
+        age = time.time() - cache_path.stat().st_mtime
+        if age < cache_ttl_seconds:
+            try:
+                with open(cache_path, "r", encoding="utf-8", errors="ignore") as f:
+                    _EXPLOIT_DB_CSV = list(csv.DictReader(f))
+                console.print(f"[dim]ExploitDB CSV loaded from cache ({int(age/3600)}h old, {len(_EXPLOIT_DB_CSV)} entries)[/dim]")
+                return _EXPLOIT_DB_CSV
+            except Exception:
+                pass
+
+    # ── Download fresh copy ──────────────────────────────────────────────────
     url = "https://raw.githubusercontent.com/offensive-security/exploitdb/master/files_exploits.csv"
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.get(url)
             if resp.status_code == 200:
-                _EXPLOIT_DB_CSV = list(csv.DictReader(io.StringIO(resp.text)))
+                raw = resp.text
+                _EXPLOIT_DB_CSV = list(csv.DictReader(io.StringIO(raw)))
+                # Persist to disk
+                try:
+                    cache_path.write_text(raw, encoding="utf-8")
+                    console.print(f"[dim]ExploitDB CSV downloaded and cached ({len(_EXPLOIT_DB_CSV)} entries) → {cache_path}[/dim]")
+                except Exception:
+                    pass
                 return _EXPLOIT_DB_CSV
     except Exception as e:
-        console.print(f"[yellow]Warning: Failed to fetch ExploitDB CSV from GitHub: {e}[/yellow]")
-    
+        console.print(f"[yellow]Warning: Failed to fetch ExploitDB CSV: {e}[/yellow]")
+
     return []
 
 async def _run_searchsploit(service: ServiceDetail) -> list[ExploitResult]:
@@ -277,11 +294,45 @@ async def run_scanner(target: str, input_type: str, live_hosts: List[str], wordl
     if not scan_targets:
         return [], []
 
+    # ── Deduplicate IPs ──────────────────────────────────────────────────────
+    # Subdomains often resolve to the same IP (CDN, shared hosting).
+    # Scanning duplicates wastes massive time.
+    import socket
+    ip_to_hosts: dict[str, list[str]] = {}
+    for h in scan_targets:
+        try:
+            ip = socket.gethostbyname(h)
+        except Exception:
+            ip = h  # Already an IP or unresolvable
+        ip_to_hosts.setdefault(ip, []).append(h)
+    
+    unique_ips = list(ip_to_hosts.keys())
+    dedup_count = len(scan_targets) - len(unique_ips)
+    if dedup_count > 0:
+        console.print(f"[dim]Deduplicated {len(scan_targets)} hosts → {len(unique_ips)} unique IPs (removed {dedup_count} duplicates)[/dim]")
+    scan_targets = unique_ips
+
     # --- NMAP Deep Scan ---
     nm = nmap.PortScanner()
-    target_str = " ".join(scan_targets)
     
-    flags = "-sV --version-intensity 9 -sC"
+    # ── Port count: user --ports flag overrides profile default ───────────
+    user_ports = getattr(run_config, 'ports', 0)
+    profile = getattr(run_config, 'profile', 'full')
+    
+    if user_ports > 0:
+        # User explicitly chose a port count
+        port_count = user_ports
+        console.print(f"[dim]Using user-specified port count: --top-ports {port_count}[/dim]")
+    elif profile == 'quick':
+        port_count = 50
+    elif profile == 'stealth':
+        port_count = 100
+    else:
+        port_count = 200  # full / compliance — covers 95%+ of real services
+    
+    port_flag = f"--top-ports {port_count}"
+    
+    flags = f"-sV --version-intensity 5 -sC {port_flag}"
     # Added -Pn to skip host discovery
     flags += " -Pn"
     
@@ -291,12 +342,22 @@ async def run_scanner(target: str, input_type: str, live_hosts: List[str], wordl
     else:
         console.print("[dim]Root privileges missing: skipping Nmap OS validation (-O) to prevent permission errors.[/dim]")
     
-    # Required Scripts
+    # Focused scripts covering the full attack surface
     scripts = [
-        "banner", "http-headers", "http-title", "http-server-header", "ssl-cert", "ssl-enum-ciphers",
-        "ssh-hostkey", "ssh-auth-methods", "ftp-anon", "ftp-syst", "smtp-commands", "smb-os-discovery",
-        "smb-security-mode", "ms-sql-info", "mysql-info", "mongodb-info", "redis-info", "vnc-info",
-        "http-methods", "http-robots.txt", "http-auth"
+        "banner", "http-title", "http-server-header", "ssl-cert",
+        "ssh-hostkey", "http-methods", "http-robots.txt",
+        # SSL/TLS vulnerabilities
+        "ssl-dh-params", "ssl-heartbleed", "ssl-poodle",
+        # Service misconfigs
+        "ftp-anon", "ftp-bounce",
+        "smtp-commands", "smtp-open-relay",
+        "ms-sql-info", "mysql-info",
+        "ldap-rootdse",
+        "rdp-enum-encryption",
+        # Web / Auth
+        "http-auth-finder", "http-backup-finder",
+        # DNS
+        "dns-zone-transfer",
     ]
     
     aggressive = not run_config.stealth
@@ -316,29 +377,52 @@ async def run_scanner(target: str, input_type: str, live_hosts: List[str], wordl
         flags += " -T4"
     else:
         flags += " -T2"
+
+    # ── Nmap timeout — prevent runaway scans ─────────────────────────────────
+    # Scale timeout with port count: ~2 sec per port per host, minimum 5 min
+    nmap_timeout = max(300, port_count * 2)
+    flags += f" --host-timeout {nmap_timeout}s"
         
-    console.print(f"[bold cyan]Running deep Nmap scan on {len(scan_targets)} hosts...[/bold cyan]")
-    try:
-        # Note: -O requires root. If we hit nmap.PortScannerError we should fallback without -O.
+    # ── Batch scanning — scan max 8 hosts at a time ──────────────────────────
+    BATCH_SIZE = 8
+    all_nm_hosts: list[str] = []
+    
+    # ── Estimated time ───────────────────────────────────────────────────────
+    time_per_host = {50: "~30s", 100: "~1m", 200: "~2m", 1000: "~5-10m"}
+    est = time_per_host.get(port_count, f"~{port_count // 50}m")
+    total_batches = (len(scan_targets) + BATCH_SIZE - 1) // BATCH_SIZE
+    
+    console.print(f"[bold cyan]Running Nmap scan: {len(scan_targets)} hosts × {port_count} ports ({est}/host, {total_batches} batch{'es' if total_batches > 1 else ''})[/bold cyan]")
+    
+    for i in range(0, len(scan_targets), BATCH_SIZE):
+        batch = scan_targets[i:i + BATCH_SIZE]
+        batch_num = (i // BATCH_SIZE) + 1
+        total_batches = (len(scan_targets) + BATCH_SIZE - 1) // BATCH_SIZE
+        
+        if total_batches > 1:
+            console.print(f"[dim]  Batch {batch_num}/{total_batches}: {len(batch)} hosts[/dim]")
+        
+        target_str = " ".join(batch)
         try:
-            nm.scan(hosts=target_str, arguments=flags)
-        except nmap.PortScannerError as e:
-            if "root privileges" in str(e).lower() or "requires root" in str(e).lower():
-                console.print("[yellow]Nmap OS detection (-O) failed due to lack of root privileges. Falling back to version scan without -O.[/yellow]")
-                fallback_flags = flags.replace(" -O", "")
-                nm.scan(hosts=target_str, arguments=fallback_flags)
-            else:
-                raise e
-    except Exception as e:
-        console.print(f"[bold red]Nmap scan entirely failed: {e}[/bold red]")
-        return scan_targets, [{"error": str(e)}]
+            try:
+                nm.scan(hosts=target_str, arguments=flags)
+            except nmap.PortScannerError as e:
+                if "root privileges" in str(e).lower() or "requires root" in str(e).lower():
+                    console.print("[yellow]Nmap OS detection (-O) failed due to lack of root privileges. Falling back without -O.[/yellow]")
+                    fallback_flags = flags.replace(" -O", "")
+                    nm.scan(hosts=target_str, arguments=fallback_flags)
+                else:
+                    raise e
+            all_nm_hosts.extend(nm.all_hosts())
+        except Exception as e:
+            console.print(f"[bold red]Nmap batch {batch_num} failed: {e}[/bold red]")
 
     actual_live = []
     scan_results = []
     
     service_exploits_list: list[ServiceExploits] = []
 
-    for host in nm.all_hosts():
+    for host in all_nm_hosts:
         host_ip = host
         actual_live.append(host_ip)
         
