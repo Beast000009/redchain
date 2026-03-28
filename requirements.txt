@@ -16,3 +16,4 @@ pytest
 beautifulsoup4
 ipinfo
 packaging
+python-dotenv

@@ -15,7 +15,7 @@ build/
 venv/
 env/
 
-# Environment variables (contains API keys — NEVER commit!)
+# Environment variables (contains API keys!)
 .env
 
 # IDE
@@ -29,7 +29,7 @@ env/
 .DS_Store
 Thumbs.db
 
-# Reports (generated per-scan, don't commit real scan data)
+# Reports (generated per-scan, don't commit)
 reports/*.json
 reports/*.md
 reports/*.csv
@@ -45,19 +45,3 @@ reports/*.txt
 .pytest_cache/
 htmlcov/
 .coverage
-coverage.xml
-
-# Jupyter notebooks (scratch files)
-*.ipynb
-.ipynb_checkpoints/
-.virtual_documents/
-
-# Anaconda / Jupyter artifacts
-anaconda_projects/
-
-# Go build cache (if building locally)
-go.sum
-vendor/
-
-# macOS quarantine attributes
-*.xattr
