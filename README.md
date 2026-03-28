@@ -23,7 +23,7 @@
 - [Pipeline Phases](#pipeline-phases)
 - [Installation](#installation)
   - [Quick Start](#quick-start)
-  - [Docker (Recommended)](#docker-recommended)
+  - [Docker (Recommended)](#docker-recommended-for-teams)
   - [Kali Linux (Easiest)](#kali-linux-easiest)
   - [macOS](#macos)
   - [Linux (Ubuntu/Debian)](#linux-ubuntudebian)
@@ -31,7 +31,6 @@
   - [Windows (WSL2)](#windows-wsl2)
 - [Configuration](#configuration)
 - [Usage](#usage)
-- [Scan Profiles](#scan-profiles)
 - [Multi-LLM Support](#multi-llm-support)
 - [Report Formats](#report-formats)
 - [Plugin System](#plugin-system)
@@ -419,6 +418,31 @@ ABUSEIPDB_API_KEY=your_key_here     # https://www.abuseipdb.com/account/api
 GREYNOISE_API_KEY=your_key_here     # https://viz.greynoise.io/account/api-key
 ```
 
+### Scope File (`scope.json`)
+
+Define authorized targets. Supports exact match, wildcard, CIDR, and exclusions:
+
+```json
+{
+  "allowed": [
+    "example.com",
+    "*.staging.example.com",
+    "192.168.1.0/24",
+    "10.0.0.1"
+  ],
+  "excluded": [
+    "prod.example.com",
+    "10.0.1.5"
+  ]
+}
+```
+
+Use `--no-scope-check` to bypass (for authorized testing only).
+
+---
+
+## Usage
+
 ### Command Overview
 
 ```
@@ -767,9 +791,6 @@ pip show redchain
 
 ---
 
-
-
-
 ## Multi-LLM Support
 
 | Provider | Model (Default) | API Key Required | Offline |
@@ -813,7 +834,7 @@ Reports include:
 - OWASP Top 10 mapping (keyword-driven)
 - MITRE ATT&CK technique mapping (dynamic, per-finding)
 - Remediation plan with priorities
-- Web app fingerprinting details (NIkto, Gobuster)
+- Web app fingerprinting details (Nikto, Gobuster)
 
 ---
 
@@ -874,8 +895,7 @@ redchain/
 │   ├── __init__.py             # Plugin base class
 │   └── loader.py               # Auto-discovery
 ├── report/
-│   ├── generator.py            # PDF/MD/JSON/CSV generation
-│   └── templates/              # HTML templates (Jinja2)
+│   └── generator.py            # PDF/MD/JSON/CSV generation
 ├── tests/                      # Unit tests
 ├── Dockerfile                  # Container support
 ├── docker-compose.yml          # One-command deployment
