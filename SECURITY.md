@@ -11,7 +11,7 @@
 
 **Please do NOT open a public GitHub issue for security vulnerabilities.**
 
-Instead, please report security issues by emailing: **security@redchain.dev**
+Instead, please report security issues by emailing: **singhpiyushsingh707@gmail.com**
 
 Include:
 - Description of the vulnerability
