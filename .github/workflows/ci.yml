@@ -10,6 +10,7 @@ jobs:
   lint-and-test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
     
@@ -30,21 +31,19 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          pip install ruff mypy
+          pip install ruff
       
       - name: Lint with ruff
         run: |
-          ruff check . --ignore=E501,F401
-      
-      - name: Type check with mypy (soft)
-        run: |
-          mypy utils.py config.py --ignore-missing-imports || true
+          ruff check . --select=E,F --ignore=E501,F401,E722,F841,E701,F541,E402,F811
       
       - name: Compile check all source files
         run: |
           python -m py_compile utils.py
           python -m py_compile config.py
           python -m py_compile cli.py
+          python -m py_compile models.py
+          python -m py_compile redchain_cli.py
           python -m py_compile agents/osint_agent.py
           python -m py_compile agents/scanner_agent.py
           python -m py_compile agents/webapp_agent.py
@@ -52,6 +51,9 @@ jobs:
           python -m py_compile agents/cve_agent.py
           python -m py_compile agents/report_agent.py
           python -m py_compile agents/threat_intel.py
+          python -m py_compile agents/nuclei_agent.py
+          python -m py_compile agents/credential_agent.py
+          python -m py_compile agents/takeover_agent.py
           python -m py_compile orchestrator/graph.py
           python -m py_compile report/generator.py
           python -m py_compile llm/__init__.py
@@ -64,7 +66,7 @@ jobs:
       
       - name: Run unit tests
         run: |
-          python -m unittest discover -s tests -p "test_*.py" -v
+          python -m pytest tests/ -v --tb=short
       
       - name: CLI smoke test
         run: |

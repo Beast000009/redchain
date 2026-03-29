@@ -1,7 +1,8 @@
 import asyncio
+from typing import Any, Dict, List
+
 import dns.asyncresolver
 import dns.resolver
-from typing import Dict, List, Any
 
 # Common DKIM selectors to test
 DKIM_SELECTORS = ["google", "selector1", "selector2", "default", "mail", "k1"]
@@ -53,7 +54,8 @@ async def run_dns_lookup(domain: str) -> Dict[str, List[str]]:
         try:
             dkim_answers = await resolver.resolve(f"{selector}._domainkey.{domain}", "TXT")
             for rdata in dkim_answers:
-                results["DKIM"].append(f"{selector}: {rdata.to_text().strip('\"')}")
+                _q = chr(34)
+                results["DKIM"].append(f"{selector}: {rdata.to_text().strip(_q)}")
         except Exception:
             pass
             
@@ -78,10 +80,10 @@ async def run_dns_lookup(domain: str) -> Dict[str, List[str]]:
                 ns_ip_answers = dns.resolver.resolve(ns_server, "A")
                 for ns_ip in ns_ip_answers:
                     try:
-                        z = dns.zone.from_xfr(dns.query.xfr(ns_ip.to_text(), domain, timeout=2))
+                        dns.zone.from_xfr(dns.query.xfr(ns_ip.to_text(), domain, timeout=2))
                         results["Zone_Transfer"].append(f"SUCCESS against {ns_server}")
                         return
-                    except Exception as e:
+                    except Exception:
                         continue
             except Exception:
                 continue
